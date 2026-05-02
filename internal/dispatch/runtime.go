@@ -32,7 +32,8 @@ type ProcessOptions struct {
 	// a graph workflow finalizes with outcome=pass, every parent source bead
 	// linked via gc.source_bead_id+gc.source_store_ref is also closed in its
 	// native store. May be nil — in which case cross-store propagation is
-	// silently skipped (single-store callers, tests without resolvers, etc.).
+	// skipped for unsupported single-store callers. When configured, resolver
+	// and source-store read failures are returned so the finalizer can retry.
 	ResolveStoreRef func(ref string) (beads.Store, error)
 	Tracef          func(format string, args ...any)
 }
@@ -516,10 +517,12 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 // closeSourceBeadChain walks gc.source_bead_id / gc.source_store_ref upward
 // from the just-finalized workflow root and closes every parent source bead
 // in its native store. The walk stops when a bead has no source pointer, when
-// a referenced store cannot be resolved, or when a bead has already been
-// closed (idempotent — a re-run of finalize after a partial crash converges
-// to the same state). This is what makes "Adopt PR" city-scope source beads
-// disappear from the human-visible queue once the rig-scope workflow merges.
+// a caller has no resolver for a cross-store reference, or when a cycle is
+// detected (idempotent — a re-run of finalize after a partial crash converges
+// to the same state). Resolver and parent-store read failures are returned so
+// the workflow-finalize bead remains open and the control loop can retry.
+// This is what makes "Adopt PR" city-scope source beads disappear from the
+// human-visible queue once the rig-scope workflow merges.
 func closeSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions) error {
 	currentStore := rootStore
 	currentID := rootID
@@ -527,7 +530,10 @@ func closeSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOpti
 	for hop := 0; hop < 32; hop++ {
 		current, err := currentStore.Get(currentID)
 		if err != nil {
-			// Missing intermediate is not fatal — the chain just stops here.
+			if opts.ResolveStoreRef != nil {
+				return fmt.Errorf("loading source-chain bead %s: %w", currentID, err)
+			}
+			opts.tracef("close-source-chain bead=%s skip reason=get_error err=%v", currentID, err)
 			return nil
 		}
 		nextID := strings.TrimSpace(current.Metadata["gc.source_bead_id"])
@@ -538,24 +544,29 @@ func closeSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOpti
 		nextStore := currentStore
 		if nextRef != "" && opts.ResolveStoreRef != nil {
 			resolved, err := opts.ResolveStoreRef(nextRef)
-			if err != nil || resolved == nil {
-				// Cannot reach the parent store from here. Skip silently —
-				// callers without a resolver are single-store contexts where
-				// cross-store propagation is not expected.
-				return nil
+			if err != nil {
+				return fmt.Errorf("resolving source store %q for bead %s: %w", nextRef, currentID, err)
+			}
+			if resolved == nil {
+				return fmt.Errorf("resolving source store %q for bead %s: nil store", nextRef, currentID)
 			}
 			nextStore = resolved
 		} else if nextRef != "" && opts.ResolveStoreRef == nil {
-			// Cross-store reference but no resolver: nothing to do.
+			opts.tracef("close-source-chain bead=%s skip reason=no_resolver ref=%s source=%s", currentID, nextRef, nextID)
 			return nil
 		}
 		key := nextRef + "|" + nextID
 		if visited[key] {
+			opts.tracef("close-source-chain bead=%s skip reason=cycle ref=%s source=%s", currentID, nextRef, nextID)
 			return nil
 		}
 		visited[key] = true
 		next, err := nextStore.Get(nextID)
 		if err != nil {
+			if opts.ResolveStoreRef != nil {
+				return fmt.Errorf("loading source bead %s in %q: %w", nextID, nextRef, err)
+			}
+			opts.tracef("close-source-chain bead=%s skip reason=source_get_error ref=%s source=%s err=%v", currentID, nextRef, nextID, err)
 			return nil
 		}
 		if next.Status != "closed" {
@@ -566,6 +577,7 @@ func closeSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOpti
 		currentStore = nextStore
 		currentID = nextID
 	}
+	opts.tracef("close-source-chain bead=%s skip reason=hop_limit limit=32", currentID)
 	return nil
 }
 
